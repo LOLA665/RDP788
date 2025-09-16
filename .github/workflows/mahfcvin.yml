@@ -1,0 +1,97 @@
+name: Deploy Windows 11 RTX4090 Pod
+
+on:
+  workflow_dispatch:
+
+jobs:
+  create-runpod:
+    runs-on: ubuntu-latest
+    timeout-minutes: 420
+    env:
+      RUNPOD_API_URL: https://api.runpod.io/graphql
+      RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+      IMAGE_NAME: mcr.microsoft.com/windows/server:ltsc2022
+      GPU_TYPE: NVIDIA RTX 4090
+      CLOUD_TYPE: SECURE
+      VOLUME_GB: 1024
+      MEMORY_GB: 64
+      VCPU_COUNT: 16
+      KEEP_SECONDS: 21600
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create pod safely
+        id: create_pod
+        run: |
+          set -euo pipefail
+          POD_NAME="gh-win11-rtx4090-$(date +%s)"
+          PAYLOAD="{\"query\":\"mutation { podFindAndDeployOnDemand(input: { cloudType: \\\"$CLOUD_TYPE\\\", gpuCount: 1, gpuTypeId: \\\"$GPU_TYPE\\\", name: \\\"$POD_NAME\\\", imageName: \\\"$IMAGE_NAME\\\", containerDiskInGb: $VOLUME_GB, volumeInGb: $VOLUME_GB, minVcpuCount: $VCPU_COUNT, minMemoryInGb: $MEMORY_GB, ports: [\\\"3389/tcp\\\"], supportPublicIp: true }) { id imageName machineId machine { podHostId } ports } }\"}"
+          RESPONSE=$(curl -s -X POST "$RUNPOD_API_URL" -H "Content-Type: application/json" -H "Authorization: Bearer $RUNPOD_API_KEY" -d "$PAYLOAD")
+          
+          if ! echo "$RESPONSE" | jq empty >/dev/null 2>&1; then
+            echo "ERROR: RunPod response is not valid JSON:"
+            echo "$RESPONSE"
+            exit 1
+          fi
+
+          POD_ID=$(echo "$RESPONSE" | jq -r '.data.podFindAndDeployOnDemand.id // empty')
+          POD_HOSTNAME=$(echo "$RESPONSE" | jq -r '.data.podFindAndDeployOnDemand.machine.podHostId // empty')
+          POD_IP=$(echo "$RESPONSE" | jq -r '.data.podFindAndDeployOnDemand.ports[0] // empty')
+
+          if [ -z "$POD_ID" ]; then
+            echo "ERROR: Could not get POD_ID. Raw response:"
+            echo "$RESPONSE"
+            exit 1
+          fi
+
+          echo "POD_ID=$POD_ID" >> $GITHUB_OUTPUT
+          echo "POD_HOSTNAME=$POD_HOSTNAME" >> $GITHUB_OUTPUT
+          echo "POD_IP=$POD_IP" >> $GITHUB_OUTPUT
+          echo "Created pod: $POD_ID (hostname: $POD_HOSTNAME, IP: $POD_IP)"
+
+      - name: Generate RDP credentials
+        id: gen_creds
+        run: |
+          USER="user$(openssl rand -hex 3)"
+          PASSWORD=$(openssl rand -base64 12 | tr -dc 'A-Za-z0-9@#%+=' | cut -c1-14)
+          echo "RDP_USER=$USER" >> $GITHUB_OUTPUT
+          echo "RDP_PASSWORD=$PASSWORD" >> $GITHUB_OUTPUT
+          echo "Generated RDP credentials: $USER / $PASSWORD"
+
+      - name: Configure Windows
+        id: setup_win
+        run: |
+          POD_ID="${{ steps.create_pod.outputs.POD_ID }}"
+          USER="${{ steps.gen_creds.outputs.RDP_USER }}"
+          PASSWORD="${{ steps.gen_creds.outputs.RDP_PASSWORD }}"
+          PS_SCRIPT="net user $USER $PASSWORD /add; net localgroup Administrators $USER /add; Set-ItemProperty -Path 'HKLM:\\System\\CurrentControlSet\\Control\\Terminal Server' -Name 'fDenyTSConnections' -Value 0; Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'; New-Item -Path C:\\runpod_init_done.txt -ItemType File -Force | Out-Null"
+          PS_B64=$(printf "%s" "$PS_SCRIPT" | iconv -f utf-8 -t utf-16le | base64 -w0)
+          EXEC_PAYLOAD="{\"query\":\"mutation { podExec(input:{podId:\\\"$POD_ID\\\", command:[\\\"powershell\\\",\\\"-EncodedCommand\\\",\\\"$PS_B64\\\"]}) { id output exitCode } }\"}"
+          curl -s -X POST "$RUNPOD_API_URL" -H "Content-Type: application/json" -H "Authorization: Bearer $RUNPOD_API_KEY" -d "$EXEC_PAYLOAD"
+
+      - name: Display RDP info
+        run: |
+          POD_ID="${{ steps.create_pod.outputs.POD_ID }}"
+          POD_HOSTNAME="${{ steps.create_pod.outputs.POD_HOSTNAME }}"
+          POD_IP="${{ steps.create_pod.outputs.POD_IP }}"
+          USER="${{ steps.gen_creds.outputs.RDP_USER }}"
+          PASSWORD="${{ steps.gen_creds.outputs.RDP_PASSWORD }}"
+          echo "===== RDP INFO ====="
+          echo "POD_ID: $POD_ID"
+          echo "POD_HOSTNAME: $POD_HOSTNAME"
+          echo "POD_IP: $POD_IP"
+          echo "RDP_USER: $USER"
+          echo "RDP_PASSWORD: $PASSWORD"
+          echo "==================="
+
+      - name: Keep pod alive for 6 hours
+        if: always()
+        run: |
+          POD_ID="${{ steps.create_pod.outputs.POD_ID }}"
+          sleep 21600 || true
+          DEL_PAYLOAD="{\"query\":\"mutation { deletePod(input:{ podId: \\\"$POD_ID\\\" }) }\"}"
+          curl -s -X POST "$RUNPOD_API_URL" -H "Content-Type: application/json" -H "Authorization: Bearer $RUNPOD_API_KEY" -d "$DEL_PAYLOAD" || true
+          echo "Pod $POD_ID terminated."
+          
