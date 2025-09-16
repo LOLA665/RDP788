@@ -1,0 +1,98 @@
+name: RunPod Windows 11 RTX4090 - 6h RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  create-runpod:
+    runs-on: ubuntu-latest
+    timeout-minutes: 420
+    env:
+      RUNPOD_API_URL: https://api.runpod.io/graphql
+      KEEP_SECONDS: 21600  # 6 ore
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Creează Pod RunPod
+        id: create_pod
+        run: |
+          POD_NAME="gh-runpod-win11-rtx4090"
+          GPU_TYPE="NVIDIA-RTX-4090"
+          IMAGE_NAME="mcr.microsoft.com/windows/server:ltsc2022"
+          CLOUD_TYPE="SECURE"
+
+          PAYLOAD=$(cat <<EOF
+{"query":"mutation { createOnDemandPod(input:{podName:\"$POD_NAME\", gpuTypeId:\"$GPU_TYPE\", cloudType:\"$CLOUD_TYPE\", imageName:\"$IMAGE_NAME\", ports:[3389], volumeInGb:1024, minMemoryInGb:64, minVcpuCount:16}) { id podHostname publicIp status } }"}
+EOF
+)
+          RESPONSE=$(curl -s -X POST "$RUNPOD_API_URL" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${{ secrets.RUNPOD_API_KEY }}" \
+            -d "$PAYLOAD")
+          POD_ID=$(echo "$RESPONSE" | jq -r '.data.createOnDemandPod.id')
+          echo "POD_ID=$POD_ID" >> $GITHUB_OUTPUT
+          echo "Created pod: $POD_ID"
+
+      - name: Așteaptă IP public
+        id: wait_ip
+        run: |
+          POD_ID="${{ steps.create_pod.outputs.POD_ID }}"
+          for i in $(seq 1 60); do
+            RESP=$(curl -s -X POST "$RUNPOD_API_URL" \
+              -H "Content-Type: application/json" \
+              -H "Authorization: Bearer ${{ secrets.RUNPOD_API_KEY }}" \
+              -d "{\"query\":\"query { pod(id:\\\"$POD_ID\\\") { status publicIp } }\"}")
+            STATUS=$(echo "$RESP" | jq -r '.data.pod.status')
+            IP=$(echo "$RESP" | jq -r '.data.pod.publicIp')
+            echo "Status=$STATUS IP=$IP"
+            if [ "$STATUS" = "RUNNING" ] && [ -n "$IP" ] && [ "$IP" != "null" ]; then
+              echo "PUBLIC_IP=$IP" >> $GITHUB_OUTPUT
+              break
+            fi
+            sleep 10
+          done
+
+      - name: Configurează Windows + Tailscale
+        id: setup_win
+        run: |
+          POD_ID="${{ steps.create_pod.outputs.POD_ID }}"
+          ADMIN_USER="Administrator"
+          ADMIN_PASSWORD=$(openssl rand -base64 18 | tr -dc 'A-Za-z0-9@#%+=' | cut -c1-20)
+          echo "RDP_USER=$ADMIN_USER" >> $GITHUB_OUTPUT
+          echo "RDP_PASSWORD=$ADMIN_PASSWORD" >> $GITHUB_OUTPUT
+
+          PS_SCRIPT="net user $ADMIN_USER $ADMIN_PASSWORD; Set-ItemProperty -Path 'HKLM:\\System\\CurrentControlSet\\Control\\Terminal Server' -Name 'fDenyTSConnections' -Value 0; Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'"
+
+          if [ -n "${{ secrets.TAILSCALE_AUTHKEY }}" ]; then
+            PS_SCRIPT="$PS_SCRIPT; iwr https://pkgs.tailscale.com/stable/tailscale-setup.exe -OutFile C:\\temp\\tailscale.exe; Start-Process C:\\temp\\tailscale.exe -ArgumentList '/S' -Wait; & 'C:\\Program Files\\Tailscale\\tailscale.exe' up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --hostname runpod-win11-$POD_ID"
+          fi
+
+          PS_B64=$(printf "%s" "$PS_SCRIPT" | iconv -f utf-8 -t utf-16le | base64 -w0)
+
+          EXEC_PAYLOAD="{\"query\":\"mutation { podExec(input:{podId:\\\"$POD_ID\\\", command:[\\\"powershell\\\",\\\"-EncodedCommand\\\",\\\"$PS_B64\\\"]}) { id output exitCode } }\"}"
+          curl -s -X POST "$RUNPOD_API_URL" -H "Content-Type: application/json" -H "Authorization: Bearer ${{ secrets.RUNPOD_API_KEY }}" -d "$EXEC_PAYLOAD"
+
+      - name: Afișează info RDP
+        run: |
+          POD_ID="${{ steps.create_pod.outputs.POD_ID }}"
+          IP="${{ steps.wait_ip.outputs.PUBLIC_IP }}"
+          RDP_USER="${{ steps.setup_win.outputs.RDP_USER }}"
+          RDP_PASSWORD="${{ steps.setup_win.outputs.RDP_PASSWORD }}"
+          echo "===== CONNECTION INFO ====="
+          echo "POD_ID: $POD_ID"
+          echo "PUBLIC_IP: $IP"
+          echo "RDP_USER: $RDP_USER"
+          echo "RDP_PASSWORD: $RDP_PASSWORD"
+          echo "RDP_DEEPLINK: rdp://full%20address=$IP:3389"
+          echo "==========================="
+
+      - name: Ține Pod-ul 6 ore și apoi termină
+        if: always()
+        run: |
+          POD_ID="${{ steps.create_pod.outputs.POD_ID }}"
+          sleep 21600
+          DEL_PAYLOAD='{"query":"mutation { deletePod(input:{ podId: \"'$POD_ID'\" }) }"}'
+          curl -s -X POST "$RUNPOD_API_URL" -H "Content-Type: application/json" -H "Authorization: Bearer ${{ secrets.RUNPOD_API_KEY }}" -d "$DEL_PAYLOAD"
+          echo "Pod $POD_ID terminated."
+          
