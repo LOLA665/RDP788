@@ -1,0 +1,48 @@
+name: RunPod Windows 11 RTX4090 RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360   # rulează maxim 6 ore
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Creează instanță RunPod cu RTX 4090
+        id: create
+        run: |
+          echo ">>> Creez instanță pe RunPod..."
+          RESPONSE=$(curl -s -X POST "https://api.runpod.io/graphql" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${{ secrets.RUNPOD_API_KEY }}" \
+            -d '{
+              "query": "mutation { podFindAndDeployOnDemand(input: { cloudType: SECURE, gpuTypeId: \"NVIDIA-RTX-4090\", minVcpuCount: 16, minMemoryInGb: 64, volumeInGb: 1024, containerDiskInGb: 50, imageName: \"mcr.microsoft.com/windows/server:ltsc2022\", ports: [3389, 22] }) { id, podHostname, imageName, machineId } }"
+            }')
+
+          echo "RESPONSE=$RESPONSE" >> $GITHUB_ENV
+          POD_ID=$(echo $RESPONSE | jq -r '.data.podFindAndDeployOnDemand.id')
+          echo "POD_ID=$POD_ID" >> $GITHUB_ENV
+
+      - name: Instalează Tailscale în pod
+        run: |
+          echo ">>> Instalez Tailscale..."
+          curl -s -X POST "https://api.runpod.io/graphql" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${{ secrets.RUNPOD_API_KEY }}" \
+            -d "{
+              \"query\": \"mutation { podExec(input: { podId: \\\"$POD_ID\\\", command: [\\\"powershell\\\", \\\"-Command\\\", \\\"iwr https://pkgs.tailscale.com/stable/tailscale-setup.exe -OutFile tailscale-setup.exe; Start-Process .\\\\tailscale-setup.exe -ArgumentList '/S' -Wait; C:\\\\Program Files\\\\Tailscale\\\\tailscale.exe up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --accept-routes --hostname=runpod-win11\\\"] }) { id output } }\"
+            }"
+
+      - name: Afișează datele de conectare
+        run: |
+          echo "======================================"
+          echo " Instanța a fost creată pe RunPod 🎉"
+          echo " Pod ID: $POD_ID"
+          echo " Conectează-te prin Tailscale."
+          echo " Ai portul RDP (3389) activ."
+          echo "======================================"
+          
