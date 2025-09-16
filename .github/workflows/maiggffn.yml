@@ -1,0 +1,150 @@
+name: RunPod Windows 11 RTX4090 - Fixed parsing (no null)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  create-runpod:
+    runs-on: ubuntu-latest
+    timeout-minutes: 420
+    env:
+      RUNPOD_API_URL: https://api.runpod.io/graphql
+      KEEP_SECONDS: 21600  # 6 ore
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create pod (try multiple mutations) and parse ID robustly
+        id: create_pod
+        run: |
+          set -euo pipefail
+          POD_NAME="gh-runpod-win11-rtx4090-$(date +%s)"
+          GPU_TYPE="NVIDIA-RTX-4090"
+          IMAGE_NAME="mcr.microsoft.com/windows/server:ltsc2022"
+          CLOUD_TYPE="SECURE"
+
+          echo "Attempt 1: podFindAndDeployOnDemand"
+          PAYLOAD1="{\"query\":\"mutation { podFindAndDeployOnDemand(input: { cloudType: \\\"$CLOUD_TYPE\\\", gpuTypeId: \\\"$GPU_TYPE\\\", imageName: \\\"$IMAGE_NAME\\\", podName: \\\"$POD_NAME\\\", ports: [3389], volumeInGb: 1024, minMemoryInGb: 64, minVcpuCount: 16 }) { id podHostname publicIp status } }\"}"
+          RESP1=$(curl -s -X POST "$RUNPOD_API_URL" -H "Content-Type: application/json" -H "Authorization: Bearer ${{ secrets.RUNPOD_API_KEY }}" -d "$PAYLOAD1")
+          echo "resp1: $RESP1" > /tmp/runpod_resp1.json || true
+
+          # Try to parse ID robustly (several possible fields)
+          POD_ID=$(echo "$RESP1" | jq -r '
+            .data.podFindAndDeployOnDemand.id // 
+            .data.createOnDemandPod.id // 
+            .data.createPod.id // 
+            (.data | .. | objects | .id? ) // empty' | awk 'NR==1{print $0}')
+          POD_HOSTNAME=$(echo "$RESP1" | jq -r '.data.podFindAndDeployOnDemand.podHostname // .data.createOnDemandPod.podHostname // .data.pod.podHostname // empty' | awk 'NR==1{print $0}')
+          POD_IP=$(echo "$RESP1" | jq -r '.data.podFindAndDeployOnDemand.publicIp // .data.createOnDemandPod.publicIp // .data.pod.publicIp // empty' | awk 'NR==1{print $0}')
+
+          if [ -z "$POD_ID" ] || [ "$POD_ID" = "null" ]; then
+            echo "Attempt 1 did not return a pod id. Trying fallback mutation (createOnDemandPod)..."
+            PAYLOAD2="{\"query\":\"mutation { createOnDemandPod(input:{podName:\\\"$POD_NAME\\\", gpuTypeId:\\\"$GPU_TYPE\\\", cloudType:\\\"$CLOUD_TYPE\\\", imageName:\\\"$IMAGE_NAME\\\", ports:[3389], volumeInGb:1024, minMemoryInGb:64, minVcpuCount:16}) { id podHostname publicIp status } }\"}"
+            RESP2=$(curl -s -X POST "$RUNPOD_API_URL" -H "Content-Type: application/json" -H "Authorization: Bearer ${{ secrets.RUNPOD_API_KEY }}" -d "$PAYLOAD2")
+            echo "resp2: $RESP2" > /tmp/runpod_resp2.json || true
+
+            POD_ID=$(echo "$RESP2" | jq -r '.data.createOnDemandPod.id // .data.createPod.id // (.data | .. | objects | .id?)' | awk 'NR==1{print $0}')
+            POD_HOSTNAME=$(echo "$RESP2" | jq -r '.data.createOnDemandPod.podHostname // .data.pod.podHostname // empty' | awk 'NR==1{print $0}')
+            POD_IP=$(echo "$RESP2" | jq -r '.data.createOnDemandPod.publicIp // .data.pod.publicIp // empty' | awk 'NR==1{print $0}')
+          fi
+
+          # Final fallback: try to find any "id" anywhere in combined responses
+          if [ -z "$POD_ID" ] || [ "$POD_ID" = "null" ]; then
+            echo "Fallback: searching any 'id' in saved responses..."
+            POD_ID=$(jq -r '..|.id? // empty' /tmp/runpod_resp1.json /tmp/runpod_resp2.json | awk 'NF{print $0; exit}')
+            if [ -n "$POD_ID" ]; then
+              echo "Found id by fallback: $POD_ID"
+            fi
+          fi
+
+          # If still empty -> print responses and fail so you can debug
+          if [ -z "$POD_ID" ] || [ "$POD_ID" = "null" ]; then
+            echo "ERROR: could not get POD_ID from RunPod responses."
+            echo "Response1:"
+            cat /tmp/runpod_resp1.json || true
+            echo "Response2:"
+            cat /tmp/runpod_resp2.json || true
+            exit 1
+          fi
+
+          # normalize null -> empty
+          if [ "$POD_HOSTNAME" = "null" ]; then POD_HOSTNAME=""; fi
+          if [ "$POD_IP" = "null" ]; then POD_IP=""; fi
+
+          echo "POD_ID=$POD_ID" >> $GITHUB_OUTPUT
+          echo "POD_HOSTNAME=$POD_HOSTNAME" >> $GITHUB_OUTPUT
+          echo "PUBLIC_IP=$POD_IP" >> $GITHUB_OUTPUT
+          echo "Created pod: $POD_ID (hostname: $POD_HOSTNAME ip: $POD_IP)"
+
+      - name: Generate credentials (random user/password)
+        id: gen_creds
+        run: |
+          set -euo pipefail
+          USER="user$(openssl rand -hex 3)"
+          PASSWORD=$(openssl rand -base64 12 | tr -dc 'A-Za-z0-9@#%+=' | cut -c1-14)
+          echo "RDP_USER=$USER" >> $GITHUB_OUTPUT
+          echo "RDP_PASSWORD=$PASSWORD" >> $GITHUB_OUTPUT
+
+      - name: Configure Windows (create user, enable RDP) and optionally install Tailscale
+        id: setup_win
+        run: |
+          set -euo pipefail
+          POD_ID="${{ steps.create_pod.outputs.POD_ID }}"
+          USER="${{ steps.gen_creds.outputs.RDP_USER }}"
+          PASSWORD="${{ steps.gen_creds.outputs.RDP_PASSWORD }}"
+
+          # Build the PowerShell actions: add user, add to admins, enable RDP, firewall
+          PS_SCRIPT="net user $USER $PASSWORD /add; net localgroup Administrators $USER /add; Set-ItemProperty -Path 'HKLM:\\System\\CurrentControlSet\\Control\\Terminal Server' -Name 'fDenyTSConnections' -Value 0; Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'; New-Item -Path C:\\runpod_init_done.txt -ItemType File -Force | Out-Null"
+
+          if [ -n "${{ secrets.TAILSCALE_AUTHKEY }}" ]; then
+            PS_SCRIPT="$PS_SCRIPT; iwr https://pkgs.tailscale.com/stable/tailscale-setup.exe -OutFile C:\\temp\\tailscale.exe; Start-Process C:\\temp\\tailscale.exe -ArgumentList '/S' -Wait; & 'C:\\Program Files\\Tailscale\\tailscale.exe' up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --hostname runpod-win11-${POD_ID}"
+          fi
+
+          PS_B64=$(printf "%s" "$PS_SCRIPT" | iconv -f utf-8 -t utf-16le | base64 -w0)
+          EXEC_PAYLOAD="{\"query\":\"mutation { podExec(input:{podId:\\\"$POD_ID\\\", command:[\\\"powershell\\\",\\\"-EncodedCommand\\\",\\\"$PS_B64\\\"]}) { id output exitCode } }\"}"
+
+          EXEC_RESP=$(curl -s -X POST "$RUNPOD_API_URL" -H "Content-Type: application/json" -H "Authorization: Bearer ${{ secrets.RUNPOD_API_KEY }}" -d "$EXEC_PAYLOAD")
+          echo "exec response saved to /tmp/runpod_exec.json"
+          echo "$EXEC_RESP" > /tmp/runpod_exec.json || true
+
+          echo "RDP_USER=${USER}" >> $GITHUB_OUTPUT
+          echo "RDP_PASSWORD=${PASSWORD}" >> $GITHUB_OUTPUT
+
+      - name: Print connection info (no waiting)
+        run: |
+          POD_ID="${{ steps.create_pod.outputs.POD_ID }}"
+          POD_HOSTNAME="${{ steps.create_pod.outputs.POD_HOSTNAME }}"
+          PUBLIC_IP="${{ steps.create_pod.outputs.PUBLIC_IP }}"
+          USER="${{ steps.gen_creds.outputs.RDP_USER }}"
+          PASSWORD="${{ steps.gen_creds.outputs.RDP_PASSWORD }}"
+
+          echo "===== REAL RDP CONNECTION INFO ====="
+          echo "POD_ID: $POD_ID"
+          if [ -n "$PUBLIC_IP" ]; then
+            echo "PUBLIC_IP: $PUBLIC_IP"
+            echo "RDP_DEEPLINK: rdp://full%20address=$PUBLIC_IP:3389"
+          elif [ -n "$POD_HOSTNAME" ]; then
+            echo "No public IP yet — Pod hostname: $POD_HOSTNAME"
+            echo "RDP_DEEPLINK (using hostname): rdp://full%20address=$POD_HOSTNAME:3389"
+          else
+            # if neither available, still print a usable placeholder that will resolve later
+            echo "No public IP or hostname returned immediately. Use Tailscale or wait for provider to assign IP."
+            echo "RDP_DEEPLINK: rdp://full%20address=<POD_ID_or_hostname_when_ready>:3389"
+          fi
+          echo "RDP_USER: $USER"
+          echo "RDP_PASSWORD: $PASSWORD"
+          echo "==================================="
+
+      - name: Keep Pod for requested time then terminate
+        if: always()
+        run: |
+          set -euo pipefail
+          POD_ID="${{ steps.create_pod.outputs.POD_ID }}"
+          KEEP="${{ env.KEEP_SECONDS }}"
+          echo "Keeping pod $POD_ID alive for $KEEP seconds..."
+          sleep "$KEEP" || true
+          echo "Terminating pod $POD_ID ..."
+          DEL_PAYLOAD="{\"query\":\"mutation { deletePod(input:{ podId: \\\"$POD_ID\\\" }) }\"}"
+          curl -s -X POST "$RUNPOD_API_URL" -H "Content-Type: application/json" -H "Authorization: Bearer ${{ secrets.RUNPOD_API_KEY }}" -d "$DEL_PAYLOAD" || true
+          echo "Terminate request sent."
+          
